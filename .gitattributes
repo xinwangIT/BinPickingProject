@@ -1,4 +1,4 @@
 vision_Notebook/sam2.1_b.pt filter=lfs diff=lfsexclude merge=basic
 vision_Notebook/yolo26n.pt filter=lfs diff=lfsexclude merge=basic
 vision_Notebook/yolov8n.pt filter=lfs diff=lfsexclude merge=basic
-
+filter=lfs - vision_Notebook/*.pt
