@@ -1,0 +1,29 @@
+capture_id=0005
+timestamp_local=2026-07-03 11:51:57.582
+timestamp_utc=2026-07-03 15:51:57.582
+timestamp_unix_ms=1783093917582
+
+roi_active=true
+roi_space=depth_grid_512x424
+roi_x=217
+roi_y=267
+roi_w=122
+roi_h=117
+roi_upscale=none
+color_bbox_valid=true
+color_bbox_x=932
+color_bbox_y=728
+color_bbox_w=374
+color_bbox_h=345
+
+color_raw.png              = 1920x1080 BGRA, native color (uncropped)
+depth_raw.png              = 512x424 16-bit; value = depth in MILLIMETERS; 0 = no data (uncropped)
+ir_raw.png                 = 512x424 16-bit IR intensity (uncropped)
+depth_roi.png              = ROI crop of depth (16-bit mm). Aligned to color_registered_roi.png
+ir_roi.png                 = ROI crop of IR (16-bit)
+color_registered_roi.png   = ROI crop of color sampled onto depth grid
+
+registration=MapDepthFrameToColorSpace (depth grid is reference; color resampled onto it)
+aligned_pair_roi=depth_roi.png + color_registered_roi.png (same grid, pixel-aligned)
+depth_units=millimeters
+depth_invalid_value=0
