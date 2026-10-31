@@ -71,3 +71,51 @@ img = np.load(base / "top_config.npy")
 plt.imshow(img, cmap='gray')
 plt.title("single depth"); plt.axis('off')
 plt.show()
+
+import numpy as np, open3d as o3d
+from pathlib import Path
+
+# ---------- CAMERA PROFILE (device-specific, set once) ----------
+L515 = dict(fx=1358.8, fy=1358.3, cx=971.5, cy=534.0,
+            unit_scale=1.0)        # 1.0 = meters, 0.001 = mm->m
+# add more profiles as you go, e.g.
+# D435 = dict(fx=..., fy=..., cx=..., cy=..., unit_scale=0.001)
+
+
+def depth_to_partial_ply(depth_seg, camera, out_dir, name,
+                         z_min=0.1, z_max=10.0, overwrite=True):
+    """Back-project a segmented depth array and save it as a .ply."""
+    fx, fy, cx, cy = camera["fx"], camera["fy"], camera["cx"], camera["cy"]
+
+    H, W = depth_seg.shape
+    z = depth_seg.astype(np.float32) * camera["unit_scale"]
+    valid = np.isfinite(z) & (z > z_min) & (z < z_max)
+
+    u, v = np.meshgrid(np.arange(W), np.arange(H))
+    x = (u - cx) * z / fx
+    y = (v - cy) * z / fy
+    pts = np.stack([x[valid], y[valid], z[valid]], axis=1).astype(np.float64)
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
+
+    # >>> THIS is where the .ply is created <<<
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)          # ensure folder exists
+    out_path = out_dir / f"{name}.ply"                  # (1) build the path
+    if overwrite or not out_path.exists():
+        o3d.io.write_point_cloud(str(out_path), pcd)    # (2) write bytes to disk
+    return out_path
+
+
+def sweep_dbscan(ply_path, eps_list, mp_list):
+    """Load a .ply and sweep DBSCAN params."""
+    cloud = o3d.io.read_point_cloud(str(ply_path))
+    print(f"loaded {len(cloud.points)} points from {ply_path}")
+    for eps in eps_list:
+        for mp in mp_list:
+            labels = np.asarray(cloud.cluster_dbscan(eps=eps, min_points=mp))
+            ids = labels[labels >= 0]
+            n = len(set(ids))
+            sizes = sorted([int((labels == l).sum()) for l in set(ids)], reverse=True)
+            print(f"eps={eps:.3f} mp={mp:3d} -> {n:2d} clusters | top10: {sizes[:10]}")
