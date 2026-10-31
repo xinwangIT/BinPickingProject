@@ -2,12 +2,14 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 from ultralytics import YOLO, SAM
-model_path = Path("/home/jpacker/BinPickingProject/vision_Notebook/runs/detect/train2/weights/best.pt")
-sam_path = "/home/jpacker/sam2.1_b.pt"
+from pathlib import Path
+base = Path("/Users/ITSum/Desktop/RealSenseD405/l515_callibration_25")
+model_path = Path("/Users/ITSum/Desktop/RealSenseD405/BinPickingProject/vision_Notebook/runs/detect/train2/weights/best.pt")
+sam_path = "/Users/ITSum/Desktop/RealSenseD405/BinPickingProject/vision_Notebook/runs/detect/SAM/sam2.1_b.pt"
 yolo_model = YOLO(model_path)
 sam_model  = SAM(sam_path)
 
-image_path = "/home/jpacker/sample_images/test_lidar/l515_bin1/rgb_0000.png"
+image_path = "/Users/ITSum/Desktop/RealSenseD405/l515_callibration_25/rgb_0000.png"
 image = cv2.imread(image_path)
 h, w = image.shape[:2]
 
@@ -28,7 +30,7 @@ if len(bboxes) > 0:
         combined_mask = masks.max(axis=0)                              # (H, W)
 
     # save for the depth step
-    np.save("/home/jpacker/sample_images/test_lidar/l515_bin1/combined_mask_0000.npy", combined_mask)
+    np.save(base, combined_mask)
 
 
     # visualize
@@ -46,11 +48,11 @@ for i, conf in enumerate(yolo_results[0].boxes.conf):
     print(f"Detection {i+1}: {conf.item():.4f}")
 
 # --- Save top-3 confidence parts as separate .npy files ---
-base = Path("/home/jpacker/sample_images/test_lidar/l515_bin1")
+base = Path("/Users/ITSum/Desktop/RealSenseD405/l515_callibration_25")
 confs_all = yolo_results[0].boxes.conf.cpu().numpy()
 bboxes_all = yolo_results[0].boxes.xyxy.cpu().numpy().astype(int)
 
-TOP_K = 3
+TOP_K = 1
 top_idx = np.argsort(confs_all)[::-1][:TOP_K]
 
 top_bboxes = bboxes_all[top_idx]
@@ -62,10 +64,10 @@ if len(top_bboxes) > 0:
     if r_top.masks is not None:
         top_masks = (r_top.masks.data.cpu().numpy() * 255).astype(np.uint8)  # (K, H, W)
         for i in range(top_masks.shape[0]):
-            out_path = f"{base}/part_mask_top{i+1}_conf{top_confs[i]:.3f}.npy"
+            out_path = f"{base}/top_config.npy"
             np.save(out_path, top_masks[i])
             print(f"Saved {out_path}")
-img = np.load(base / "part_mask_top1_conf0.910.npy")
+img = np.load(base / "top_config.npy")
 plt.imshow(img, cmap='gray')
 plt.title("single depth"); plt.axis('off')
 plt.show()
