@@ -54,11 +54,28 @@ def load_models(yolo_weights, sam_weights):
 # 2. Detection + segmentation
 # ============================================================
 def detect_objects(yolo_model, image):
-    """Run YOLO on a BGR image. Returns (bboxes (N,4) int, confs (N,))."""
+    """
+    Run YOLO on a BGR image.
+
+    Returns
+    -------
+    bboxes  : (N,4) int   -- [x_min, y_min, x_max, y_max]
+    centers : (N,2) float -- sub-pixel bbox centers [u, v]
+    confs   : (N,) float  -- confidences
+    """
     results = yolo_model(image)
+
     bboxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
     confs = results[0].boxes.conf.cpu().numpy()
-    return bboxes, confs
+
+    # Sub-pixel centers (do NOT truncate to int — we keep precision
+    # so the CSV can reflect the true bbox midpoint).
+    centers = np.empty((len(bboxes), 2), dtype=np.float64)
+    for i, (x_min, y_min, x_max, y_max) in enumerate(bboxes):
+        centers[i, 0] = (x_min + x_max) / 2.0   # u
+        centers[i, 1] = (y_min + y_max) / 2.0   # v
+
+    return bboxes, centers, confs
 
 
 def segment_objects(sam_model, image, bboxes):
@@ -76,24 +93,25 @@ def segment_image(yolo_model, sam_model, image, top_k=1):
 
     Returns
     -------
-    top_masks : (K, H, W) uint8  -- per-object masks, sorted by conf desc
-    top_confs : (K,)             -- matching confidences
-    combined_mask : (H, W) uint8 -- pixel-wise max over the top-K masks
-                                    (FIX: original used *all* masks here;
-                                    now it's top-K — set top_k large for "all")
+    top_masks    : (K, H, W) uint8  -- per-object masks, sorted by conf desc
+    top_centers  : (K, 2) float     -- sub-pixel bbox centers for top-K objects
+    top_confs    : (K,)             -- matching confidences
+    combined_mask: (H, W) uint8     -- pixel-wise max over the top-K masks
     """
-    bboxes, confs = detect_objects(yolo_model, image)
+    bboxes, centers, confs = detect_objects(yolo_model, image)
     if len(bboxes) == 0:
         raise RuntimeError("no YOLO detections — nothing to segment")
 
     top_idx = np.argsort(confs)[::-1][:top_k]
     top_bboxes = bboxes[top_idx]
+    top_centers = centers[top_idx]
     top_confs = confs[top_idx]
 
     top_masks = segment_objects(sam_model, image, top_bboxes)
     combined_mask = top_masks.max(axis=0) if top_masks.size else \
         np.zeros(image.shape[:2], dtype=np.uint8)
-    return top_masks, top_confs, combined_mask
+
+    return top_masks, top_centers, top_confs, combined_mask
 
 
 # ============================================================
@@ -201,7 +219,7 @@ def process_frame(yolo_model, sam_model, image, depth, camera: CameraIntrinsics,
     End-to-end per-frame pipeline.
 
     Returns a dict with:
-        top_masks, top_confs, combined_mask,
+        top_masks, top_centers, top_confs, combined_mask,
         depth_seg, points, pcd, ply_path (or None if save_ply=False)
     """
     out_dir = Path(out_dir)
@@ -210,12 +228,14 @@ def process_frame(yolo_model, sam_model, image, depth, camera: CameraIntrinsics,
     if isinstance(depth, (str, Path)):
         depth = load_depth(depth, verbose=verbose)
 
-    top_masks, top_confs, combined_mask = segment_image(
+    top_masks, top_centers, top_confs, combined_mask = segment_image(
         yolo_model, sam_model, image, top_k=top_k)
 
     if verbose:
         print(f"[segment] kept {len(top_confs)} detections (top_k={top_k}) "
               f"conf={[f'{c:.3f}' for c in top_confs]}")
+        print(f"[segment] centers (u,v)="
+              f"{[tuple(np.round(c, 1)) for c in top_centers]}")
 
     if save_masks:
         np.save(out_dir / f"{name}_combined_mask.npy", combined_mask)
@@ -248,6 +268,7 @@ def process_frame(yolo_model, sam_model, image, depth, camera: CameraIntrinsics,
 
     return dict(
         top_masks=top_masks,
+        top_centers=top_centers,
         top_confs=top_confs,
         combined_mask=combined_mask,
         depth_seg=depth_seg,
@@ -260,25 +281,61 @@ def process_frame(yolo_model, sam_model, image, depth, camera: CameraIntrinsics,
 # ============================================================
 # 6. Clustering + cylinder pose
 # ============================================================
-def cluster_cloud(pcd, eps=0.015, min_points=20, voxel=0.003):
-    """Voxel-downsample, remove outliers, run DBSCAN. Returns (pcd, labels)."""
+def cluster_cloud(pcd, eps=0.015, min_points=80, voxel=0.003):
+    """
+    Voxel-downsample, remove outliers, run DBSCAN. Returns (pcd, labels).
+
+    NOTE: min_points default raised from 20 -> 80. Small point blobs
+    (e.g. 65 points) were being clustered and then trivially "fit" as
+    cylinders with 100% inlier ratio. 80 is a much safer floor for
+    real objects at ~3 mm voxel resolution.
+    """
     pcd = pcd.voxel_down_sample(voxel)
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
     labels = np.asarray(pcd.cluster_dbscan(eps=eps, min_points=min_points))
     return pcd, labels
 
 
-def fit_cylinder_pose(pts, thresh=0.01, max_iter=1000):
-    """RANSAC-fit a cylinder to a cluster. Returns a pose dict or None."""
-    if len(pts) < 30:
+def fit_cylinder_pose(pts, thresh=0.01, max_iter=1000,
+                      min_pts=50, min_inliers=30,
+                      max_inlier_ratio=0.95,
+                      radius_min=0.005, radius_max=0.5):
+    """
+    RANSAC-fit a cylinder to a cluster. Returns a pose dict or None.
+
+    Includes sanity gates that reject degenerate fits:
+      - too few points / inliers
+      - radius outside the physically plausible range
+      - near-100% inlier ratio on a non-trivial cloud (trivial fit)
+
+    Set the guards to None to disable any individual check.
+    """
+    if len(pts) < min_pts:
         return None
 
     cyl = Cylinder()
     axis, center, radius, inliers = cyl.fit(pts, thresh=thresh,
                                             maxIteration=max_iter)
-    if inliers is None or len(inliers) < 20 or radius <= 0:
+    if inliers is None or len(inliers) < min_inliers or radius <= 0:
         return None
 
+    n_pts = int(len(pts))
+    n_inl = int(len(inliers))
+    inlier_ratio = n_inl / max(n_pts, 1)
+
+    # --- sanity gates -------------------------------------------------
+    # 1. radius physically plausible for a bin-picking cylinder
+    if radius_min is not None and radius < radius_min:
+        return None
+    if radius_max is not None and radius > radius_max:
+        return None
+    # 2. near-100% inlier ratio on a non-trivial cloud = trivial fit
+    if (max_inlier_ratio is not None
+            and n_pts > 50
+            and inlier_ratio > max_inlier_ratio):
+        return None
+
+    # --- normalize axis ----------------------------------------------
     axis = np.asarray(axis, dtype=float)
     n = np.linalg.norm(axis)
     if n < 1e-9:
@@ -297,10 +354,20 @@ def fit_cylinder_pose(pts, thresh=0.01, max_iter=1000):
     t = float(np.dot(centroid - center, axis))
     axis_point = center + t * axis
 
-    # orthonormal frame with z = cylinder axis
+    # --- orthonormal frame with z = cylinder axis --------------------
     z_axis = axis
+    # pick a reference vector that is NOT nearly parallel to z_axis
     ref = np.array([0.0, 0.0, 1.0]) if abs(z_axis[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
-    x_axis = np.cross(ref, z_axis); x_axis /= np.linalg.norm(x_axis)
+    x_axis = np.cross(ref, z_axis)
+    nx = np.linalg.norm(x_axis)
+    if nx < 1e-6:
+        # fallback: z_axis was parallel to our first choice — try another
+        ref = np.array([0.0, 1.0, 0.0])
+        x_axis = np.cross(ref, z_axis)
+        nx = np.linalg.norm(x_axis)
+        if nx < 1e-6:
+            return None
+    x_axis = x_axis / nx
     y_axis = np.cross(z_axis, x_axis)
     rot = np.column_stack([x_axis, y_axis, z_axis])
     quat = R.from_matrix(rot).as_quat()
@@ -311,15 +378,15 @@ def fit_cylinder_pose(pts, thresh=0.01, max_iter=1000):
         rotation=rot,
         quat=quat,
         radius=float(radius),
-        n_inliers=int(len(inliers)),
-        n_points=int(len(pts)),
-        inlier_ratio=float(len(inliers) / len(pts)),
+        n_inliers=n_inl,
+        n_points=n_pts,
+        inlier_ratio=float(inlier_ratio),
         centroid=centroid,
         ransac_center=center,
     )
 
 
-def process_ply(ply_path, eps=0.015, min_points=20, thresh=0.01,
+def process_ply(ply_path, eps=0.015, min_points=80, thresh=0.01,
                 save_overlay=True, verbose=True):
     """Cluster a PLY and fit a cylinder per cluster. Returns a list of row dicts."""
     ply_path = Path(ply_path)
@@ -335,7 +402,7 @@ def process_ply(ply_path, eps=0.015, min_points=20, thresh=0.01,
 
     if verbose:
         print(f"{ply_path.name}: {len(pts_all)} pts, "
-              f"{len(cluster_ids)} clusters")
+              f"{len(cluster_ids)} clusters (eps={eps}, min_points={min_points})")
 
     rows = []
     overlay = o3d.geometry.PointCloud()
@@ -345,7 +412,15 @@ def process_ply(ply_path, eps=0.015, min_points=20, thresh=0.01,
         pose = fit_cylinder_pose(pts, thresh=thresh)
         if pose is None:
             if verbose:
-                print(f"  cluster {cid:2d} ({len(pts):5d} pts): fit FAILED")
+                # give a reason so tuning is less guesswork
+                reason = "unknown"
+                if len(pts) < 50:
+                    reason = "too few points"
+                elif len(pts) > 0:
+                    # cheap re-check for the degenerate case
+                    r_est = None  # not recomputed; message is best-effort
+                    reason = "rejected by sanity gate (radius / inlier ratio)"
+                print(f"  cluster {cid:2d} ({len(pts):5d} pts): fit FAILED ({reason})")
             continue
 
         if verbose:
@@ -393,7 +468,7 @@ def sweep_dbscan(ply_path, eps_list, mp_list, voxel=0.003):
     """
     Try combinations of eps/min_points. Returns a list of result dicts.
 
-    FIX: now applies the same preprocessing as cluster_cloud (voxel +
+    Applies the same preprocessing as cluster_cloud (voxel +
     statistical outlier removal), so the eps/mp you pick here transfers
     directly to process_ply(). Set voxel=0 to sweep the raw cloud.
     """
@@ -427,18 +502,80 @@ def print_sweep(results):
 
 
 # ============================================================
-# 8. Save poses
+# 8. Save poses (with pixel centers matched by re-projection)
 # ============================================================
-def save_poses_to_csv(rows, csv_path):
-    """Write pose rows to CSV. Returns (df, csv_path_or_None)."""
+def save_poses_to_csv(rows, csv_path, centers=None,
+                      camera: CameraIntrinsics = L515,
+                      max_px_dist: Optional[float] = None,
+                      verbose: bool = True):
+    """
+    Write pose rows to CSV, attaching a YOLO pixel center to each row.
+
+    Matching is done by RE-PROJECTING each cluster's 3D centroid
+    (cx, cy, cz) back to pixel space with the camera intrinsics, then
+    snapping to the nearest YOLO center. This is robust to:
+      - top_k > 1 (multiple detections)
+      - one object producing multiple DBSCAN clusters
+      - RANSAC failing on some clusters (rows get dropped, but the
+        remaining rows still get the correct detection)
+
+    Each row gets:
+      det_idx      : index into the ``centers`` array that matched
+      det_px_dist  : pixel-space distance from re-projected centroid
+                     to that YOLO center (lower = better match)
+      center_u/_v  : the YOLO bbox center in pixels
+
+    If ``max_px_dist`` is set and the nearest YOLO center is farther
+    than that, the row's center_u/_v are left as None (no confident
+    match) but the row is still written.
+
+    Returns (df, csv_path_or_None).
+    """
+    # 1. Initialize the new columns so they always exist.
+    for row in rows:
+        row["det_idx"] = None
+        row["det_px_dist"] = None
+        row["center_u"] = None
+        row["center_v"] = None
+
+    # 2. Match each row's re-projected centroid to the nearest YOLO center.
+    if centers is not None and len(centers) > 0:
+        centers_arr = np.asarray(centers, dtype=float).reshape(-1, 2)
+        for row in rows:
+            X, Y, Z = row.get("cx"), row.get("cy"), row.get("cz")
+            if X is None or Y is None or Z is None:
+                continue
+            if not (np.isfinite(X) and np.isfinite(Y) and np.isfinite(Z)) or Z <= 0:
+                continue
+            u = camera.fx * X / Z + camera.cx
+            v = camera.fy * Y / Z + camera.cy
+            d = np.hypot(centers_arr[:, 0] - u, centers_arr[:, 1] - v)
+            j = int(np.argmin(d))
+            row["det_idx"] = j
+            row["det_px_dist"] = float(d[j])
+            if max_px_dist is None or d[j] <= max_px_dist:
+                row["center_u"] = float(centers_arr[j, 0])
+                row["center_v"] = float(centers_arr[j, 1])
+            elif verbose:
+                print(f"[csv] cluster {row.get('cluster')}: nearest "
+                      f"detection {j} is {d[j]:.1f} px away "
+                      f"(> max_px_dist={max_px_dist}); leaving center blank")
+
     csv_path = Path(csv_path)
     df = pd.DataFrame(rows)
     if df.empty:
         print("[csv] no rows — nothing written")
         return df, None
+
+    # 3. Reorder so the pixel / detection columns appear near the front.
+    front_order = ["det_idx", "det_px_dist", "center_u", "center_v"]
+    other = [c for c in df.columns if c not in front_order]
+    df = df[front_order + other]
+
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(csv_path, index=False)
-    print(f"[csv] wrote {csv_path} ({len(df)} rows)")
+    if verbose:
+        print(f"[csv] wrote {csv_path} ({len(df)} rows)")
     return df, csv_path
 
 
@@ -449,12 +586,19 @@ def run_full_pipeline(base_dir, yolo_weights, sam_weights,
                       rgb_path=None, depth_path=None,
                       camera: CameraIntrinsics = L515,
                       name="frame", top_k=1,
-                      eps=0.015, min_points=20, ransac_thresh=0.01,
+                      eps=0.015, min_points=80, ransac_thresh=0.01,
                       do_sweep=False, save_overlay=True,
-                      visualize=False):
+                      visualize=False,
+                      max_px_dist: Optional[float] = 150.0,
+                      verbose: bool = True):
     """
     Runs the entire pipeline and returns a summary dict.
     Use individual functions instead if you need finer control.
+
+    max_px_dist defaults to 150 px: if a cluster's re-projected
+    centroid is farther than that from any YOLO center, its
+    center_u/center_v are left blank instead of being silently
+    attached to the wrong detection.
     """
     base = Path(base_dir)
     rgb_path = Path(rgb_path) if rgb_path else base / "rgb_0000.png"
@@ -467,12 +611,13 @@ def run_full_pipeline(base_dir, yolo_weights, sam_weights,
         depth_path = find_depth_file(base)
     if depth_path is None:
         raise IOError(f"no depth file in {base}")
-    depth = load_depth(depth_path)
+    depth = load_depth(depth_path, verbose=verbose)
 
     yolo, sam = load_models(yolo_weights, sam_weights)
 
     frame = process_frame(yolo, sam, image, depth, camera,
-                          out_dir=base, name=name, top_k=top_k)
+                          out_dir=base, name=name, top_k=top_k,
+                          verbose=verbose)
     ply_path = frame["ply_path"]
 
     if visualize:
@@ -482,13 +627,23 @@ def run_full_pipeline(base_dir, yolo_weights, sam_weights,
     if do_sweep:
         sweep = sweep_dbscan(ply_path,
                              eps_list=[0.005, 0.010, 0.015, 0.020, 0.025],
-                             mp_list=[10, 20, 40, 60])
+                             mp_list=[40, 60, 80, 100])
         print_sweep(sweep)
 
     rows = process_ply(ply_path, eps=eps, min_points=min_points,
-                       thresh=ransac_thresh, save_overlay=save_overlay)
+                       thresh=ransac_thresh, save_overlay=save_overlay,
+                       verbose=verbose)
+
+    centers = frame.get("top_centers", None)
+
     df, csv_path = save_poses_to_csv(
-        rows, base / f"{ply_path.stem}_poses.csv")
+        rows,
+        base / f"{ply_path.stem}_poses.csv",
+        centers=centers,
+        camera=camera,
+        max_px_dist=max_px_dist,
+        verbose=verbose,
+    )
 
     return dict(
         ply_path=ply_path,
